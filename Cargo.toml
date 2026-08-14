@@ -1,0 +1,45 @@
+[package]
+name = "peerchat"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+# libp2p：P2P 网络框架。
+# 启用功能说明：
+# - tcp/dns/noise/yamux/mdns/ping/tokio：基础传输、加密、发现、心跳（第一层加密）
+# - macros：为组合 Behaviour 提供 #[derive(NetworkBehaviour)] 宏
+# - request-response：提供"请求-应答"RPC 协议，聊天和文件传输都建立在它之上
+# - json：request-response 内置的 JSON 序列化编解码器（省去手写字节编解码）
+libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "mdns", "ping", "tokio", "macros", "request-response", "json", "kad"] }
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+
+# 序列化：所有应用层消息（含加密信封里的明文）都用 serde_json 编码
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ===== 应用层（第二层）加密与密钥协商 =====
+# chacha20poly1305：AEAD 对称加密，负责对消息体加密封装 + 完整性校验（篡改即解密失败）
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+# x25519-dalek：X25519 椭圆曲线密钥交换，用于在已通过 Noise 认证的双方间协商出共享密钥
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# sha2：哈希，用于把 ECDH 共享秘密扩展为对称密钥的原料
+sha2 = "0.10"
+# hkdf：基于 HMAC 的密钥派生函数，把 ECDH 共享秘密正规地派生为会话密钥
+hkdf = "0.12"
+# rand：随机数，用于生成 x25519 私钥、每条消息的随机 nonce、文件 ID 等
+rand = "0.8"
+# hex：把公钥等二进制打印成十六进制字符串，方便在日志中展示（学习用）
+hex = "0.4"
+# chrono：本地时间格式化（聊天记录显示发送时刻）
+chrono = "0.4"
+# rfd：跨平台原生文件选择对话框（发送文件时弹出系统选文件框）
+rfd = "0.15"
+# base64：把 Envelope 的 nonce/密文、文件分片等二进制编码进 JSON 时使用
+base64 = "0.22"
+
+# TUI（终端图形界面）：ratatui 负责渲染界面；crossterm 负责终端控制与按键读取。
+# 注意：不直接依赖 crossterm，而是用 ratatui 再导出的 ratatui::crossterm
+#（ratatui 0.30 默认启用 crossterm backend 并 re-export crossterm crate），
+# 这样能保证 crossterm 版本与 ratatui 内部完全一致，避免类型不匹配。
+ratatui = "0.30.2"
