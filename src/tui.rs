@@ -1,4 +1,4 @@
-﻿//! TUI 界面模块：左侧联系人 + 右侧内容（聊天 / 文件 / 进度 / 日志 / 已收）。
+//! TUI 界面模块：左侧联系人 + 右侧内容（聊天 / 文件 / 进度 / 日志 / 已收）。
 //!
 //! 设计目标：简洁、克制、蓝色调、留白充足，不像传统 IRC 那样密密麻麻。
 //! - 顶部：程序名 + 自己的昵称；右上角一个 [ 设置 ] 按钮（点一下就能改昵称）。
@@ -74,6 +74,8 @@ pub enum UiCmd {
     SetNickname(String),
     /// 通过「+加好友」添加一个外网对端。`bootstrap=true` 视为 DHT 引导站点。
     AddFriend { addr: String, bootstrap: bool },
+    /// 展示自己的 PeerId 和监听地址（可复制给好友做直连）。
+    ShowMyAddr,
     Quit,
 }
 
@@ -115,6 +117,8 @@ pub struct UiState {
     pub chat_input_rect: Rect,
     /// 右上角 [设置] 按钮的命中矩形。
     pub settings_rect: Rect,
+    /// 右上角 [我的地址] 按钮的命中矩形。
+    pub myaddr_rect: Rect,
     /// 聊天页 [发文件] 按钮的命中矩形。
     pub sendfile_rect: Rect,
     /// 左侧「+加好友」按钮的命中矩形。
@@ -145,6 +149,7 @@ impl Default for UiState {
             tab_rects: Vec::new(),
             chat_input_rect: Rect::default(),
             settings_rect: Rect::default(),
+            myaddr_rect: Rect::default(),
             sendfile_rect: Rect::default(),
             addfriend_rect: Rect::default(),
             mouse_col: 0,
@@ -188,6 +193,10 @@ pub fn poll_keys(ui: &mut UiState, state: &mut AppState) -> Vec<UiCmd> {
                 }
             }
             Ok(Event::Mouse(me)) => handle_mouse(ui, me, &mut cmds),
+            Ok(Event::Resize(_, _)) => {
+                // 窗口大小变化时重置滚动位置，自动滚到底部显示最新消息
+                ui.chat_scroll = 0;
+            }
             _ => {}
         }
     }
@@ -335,6 +344,11 @@ fn handle_mouse(ui: &mut UiState, me: MouseEvent, cmds: &mut Vec<UiCmd>) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let p = (me.column, me.row);
+            // 右上角 [我的地址] 按钮
+            if in_rect(p, ui.myaddr_rect) {
+                cmds.push(UiCmd::ShowMyAddr);
+                return;
+            }
             // 右上角 [设置] 按钮
             if in_rect(p, ui.settings_rect) {
                 ui.editing_nick = true;
@@ -442,7 +456,7 @@ pub fn draw(f: &mut Frame, state: &AppState, ui: &mut UiState) {
     // 顶部：标题行 + 标签页行
     let top = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(outer[0]);
     let title_row =
-        Layout::horizontal([Constraint::Length(16), Constraint::Min(0), Constraint::Length(12)])
+        Layout::horizontal([Constraint::Length(16), Constraint::Min(0), Constraint::Length(24)])
             .split(top[0]);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -457,16 +471,27 @@ pub fn draw(f: &mut Frame, state: &AppState, ui: &mut UiState) {
             .style(Style::default().fg(Color::DarkGray)),
         title_row[1],
     );
-    // 设置按钮
+    // 右上角两个按钮：[我的地址] + [设置]
+    let top_btns = Layout::horizontal([Constraint::Length(12), Constraint::Length(12)])
+        .split(title_row[2]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " [我的地址] ",
+            Style::default().fg(Color::Blue),
+        )))
+        .alignment(Alignment::Center),
+        top_btns[0],
+    );
+    ui.myaddr_rect = top_btns[0];
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " [ 设置 ] ",
             Style::default().fg(Color::Blue),
         )))
         .alignment(Alignment::Center),
-        title_row[2],
+        top_btns[1],
     );
-    ui.settings_rect = title_row[2];
+    ui.settings_rect = top_btns[1];
 
     // 标签页
     let tabs = [Tab::Chat, Tab::Files, Tab::Progress, Tab::Log, Tab::Received];
@@ -683,10 +708,11 @@ fn draw_chat(f: &mut Frame, area: Rect, state: &AppState, ui: &mut UiState) {
 
     let total = entries.len() as u16;
     let max_start = if total > avail { total - avail } else { 0 };
-    let mut start = max_start.saturating_sub(ui.chat_scroll);
-    if start > max_start {
-        start = max_start;
+    // 限制滚动量在合理范围内，避免累积过大导致需要滚很多下才能回到底部
+    if ui.chat_scroll > max_start {
+        ui.chat_scroll = max_start;
     }
+    let start = max_start.saturating_sub(ui.chat_scroll);
     let (x, y0, w) = (layout[1].x, layout[1].y, layout[1].width);
     let mut lines: Vec<Line> = Vec::new();
     for (idx, e) in entries.iter().enumerate() {

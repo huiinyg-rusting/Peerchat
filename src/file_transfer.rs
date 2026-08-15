@@ -161,11 +161,22 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-/// 用户发送文件：读文件、切分、为**每个已连接节点**发邀请。
+/// 用户发送文件：读文件、切分、为目标节点发邀请。
+/// - TUI 模式：只发给当前选中的联系人（符合"在和谁聊天就发给谁"的直觉）
+/// - headless 模式：群发给所有已连接节点（无选中概念）
 pub fn start_file_send(swarm: &mut Swarm<MyBehaviour>, state: &mut AppState, path: &str) {
-    let peers: Vec<PeerId> = state.connected.iter().copied().collect();
+    let peers: Vec<PeerId> = if state.tui_enabled {
+        state.selected_peer.into_iter().collect()
+    } else {
+        state.connected.iter().copied().collect()
+    };
     if peers.is_empty() {
-        state.log("[文件] 当前没有任何已连接的节点，无法发送".to_string());
+        let msg = if state.tui_enabled {
+            "[文件] 请先在左侧选择一个联系人再发文件".to_string()
+        } else {
+            "[文件] 当前没有任何已连接的节点，无法发送".to_string()
+        };
+        state.log(msg);
         return;
     }
 
@@ -374,8 +385,6 @@ pub fn on_file_response(
                 }
             };
             state.record_to_peer(peer, ChatRecord::file(true, &filename, &text, now_ts()));
-            state.file_outstanding.retain(|_, (fid, _)| *fid != file_id);
-            state.outgoing_files.remove(&file_id);
             state.file_outstanding.retain(|_, (fid, _)| *fid != file_id);
             state.outgoing_files.remove(&file_id);
         }

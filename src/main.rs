@@ -156,7 +156,8 @@ struct AppState {
     local_peer_id: PeerId,
     /// 本节点的监听地址（已拼上 /p2p/<id>），可直接发给好友做「直连」。
     listen_addrs: Vec<String>,
-    /// DHT 路由表中的节点数（仅作展示）。
+    /// DHT 路由表中的节点数（仅作展示；预留字段，当前未在 UI 显示）。
+    #[allow(dead_code)]
     dht_routing_peers: usize,
     /// 已建立连接的节点集合（用于在线判定与文件广播目标）。
     connected: HashSet<PeerId>,
@@ -182,10 +183,21 @@ struct AppState {
     pending_offers: HashMap<PeerId, Vec<file_transfer::PendingOffer>>,
     /// 已发出的文件协议请求 -> (文件ID, 请求类型)。
     file_outstanding: HashMap<OutboundRequestId, (u64, OutboundReq)>,
+    /// 待确认的聊天消息：request_id -> (目标节点, 消息内容, 已重试次数)。
+    /// 收到 ACK 则移除；超时/失败则自动重传，最多 3 次。
+    pending_chat_msgs: HashMap<OutboundRequestId, (PeerId, ChatMsg, u32)>,
+    /// 标记哪些对话有未持久化的改动（延迟批量写入用，避免每条消息全量写盘）。
+    dirty_conversations: HashSet<PeerId>,
 }
 
 impl AppState {
-    fn new(crypto: AppCrypto, nickname: String, tui_enabled: bool, known_peers: Vec<PeerId>) -> Self {
+    fn new(
+        crypto: AppCrypto,
+        nickname: String,
+        tui_enabled: bool,
+        local_peer_id: PeerId,
+        known_peers: Vec<PeerId>,
+    ) -> Self {
         // 启动时从 conversations/ 目录恢复已知联系人（当前都算离线）
         let mut peers = HashMap::new();
         for pid in known_peers {
@@ -206,7 +218,7 @@ impl AppState {
             nickname,
             tui_enabled,
             dht_enabled: false,
-            local_peer_id: PeerId::random(),
+            local_peer_id,
             listen_addrs: Vec::new(),
             dht_routing_peers: 0,
             connected: HashSet::new(),
@@ -221,6 +233,8 @@ impl AppState {
             incoming_files: HashMap::new(),
             pending_offers: HashMap::new(),
             file_outstanding: HashMap::new(),
+            pending_chat_msgs: HashMap::new(),
+            dirty_conversations: HashSet::new(),
         }
     }
 
@@ -252,7 +266,7 @@ impl AppState {
         })
     }
 
-    /// 把一条记录写进与某联系人的聊天历史，并立即持久化。
+    /// 把一条记录写进与某联系人的聊天历史，并标记为待持久化（延迟批量写入）。
     /// - inbound 且不是当前对话窗口 => 未读数 +1；
     /// - 始终把未读清零交给"选中该联系人"时处理。
     fn record_to_peer(&mut self, peer: PeerId, record: ChatRecord) {
@@ -265,14 +279,24 @@ impl AppState {
         if bump_unread {
             info.unread = info.unread.saturating_add(1);
         }
-        // 持久化
-        let conv = config::ConversationFile {
-            peer_id: peer.to_string(),
-            nickname: info.nickname.clone(),
-            last_addr: info.last_addr.clone(),
-            records: info.records.clone(),
-        };
-        config::save_conversation(&conv);
+        // 标记为脏，由定时 flush_conversations 批量写盘（避免每条消息全量写 JSON）
+        self.dirty_conversations.insert(peer);
+    }
+
+    /// 把所有标记为脏的对话持久化到磁盘（批量写入，提升性能）。
+    fn flush_conversations(&mut self) {
+        let dirty: Vec<PeerId> = self.dirty_conversations.drain().collect();
+        for peer in dirty {
+            if let Some(info) = self.peers.get(&peer) {
+                let conv = config::ConversationFile {
+                    peer_id: peer.to_string(),
+                    nickname: info.nickname.clone(),
+                    last_addr: info.last_addr.clone(),
+                    records: info.records.clone(),
+                };
+                config::save_conversation(&conv);
+            }
+        }
     }
 
     /// 设置昵称（写入 config.json，并在日志/相应记录里反映）。
@@ -314,7 +338,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // 启动时恢复已知联系人
     let known_peers = config::list_known_peers();
-    let mut state = AppState::new(app_crypto, nickname.clone(), tui_enabled, known_peers);
+    let mut state = AppState::new(app_crypto, nickname.clone(), tui_enabled, peer_id, known_peers);
     state.log(format!("[启动] 昵称: {nickname}, PeerID: {peer_id}"));
     state.log(format!("[启动] 配置已保存到 config.json；聊天记录保存到 conversations/"));
     state.log(format!("[启动] 应用层 X25519 公钥: {}", hex::encode(state.crypto.pubkey)));
@@ -363,7 +387,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     state.log("[等待] 正在扫描局域网内的其他 P2P 节点…".to_string());
 
-    // ===== 5. 外网部分：DHT 引导 + 直连拨号 =====
+    // ===== 6. 外网部分：DHT 引导 + 直连拨号 =====
     // 合并命令行参数与已持久化（TUI「+加好友」添加）的好友/引导站点
     let bootstrap_list: Vec<String> = cli
         .bootstrap
@@ -424,7 +448,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // ===== 6. TUI 初始化 =====
+    // ===== 7. TUI 初始化 =====
     let mut ui = tui::UiState::default();
     let mut terminal: Option<ratatui::DefaultTerminal> = None;
     if state.tui_enabled {
@@ -436,7 +460,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tui::refresh_file_list(&mut ui);
     }
 
-    // ===== 7. 后台读取 stdin（仅 headless 模式）=====
+    // ===== 8. 后台读取 stdin（仅 headless 模式）=====
     let mut stdin_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>> = None;
     if !state.tui_enabled {
         let (stdin_tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -458,17 +482,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stdin_rx = Some(rx);
     }
 
-    // ===== 8. 优雅退出机制 =====
+    // ===== 9. 优雅退出机制 =====
     let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let default_duration = Duration::from_secs(365 * 24 * 3600);
     let mut exit_timer = Box::pin(tokio::time::sleep(
         duration.map(Duration::from_secs).unwrap_or(default_duration),
     ));
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    // 聊天记录延迟批量写入：每 3 秒把有改动的对话批量写盘，避免每条消息全量写 JSON
+    let mut save_timer = tokio::time::interval(Duration::from_secs(3));
     // DHT 定时刷新：周期性地向 DHT 查询在线节点，维持路由表与发现能力
     let mut dht_timer = tokio::time::interval(Duration::from_secs(20));
 
-    // ===== 9. 主事件循环 =====
+    // ===== 10. 主事件循环 =====
     let mut quit = false;
     loop {
         if let Some(term) = terminal.as_mut() {
@@ -493,6 +519,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         file_transfer::reject_file(&mut swarm, &mut state, peer, file_id);
                     }
                     tui::UiCmd::SetNickname(n) => state.set_nickname(n),
+                    tui::UiCmd::ShowMyAddr => {
+                        state.log(format!("[我的信息] PeerId: {}", state.local_peer_id));
+                        if state.listen_addrs.is_empty() {
+                            state.log("[我的信息] 尚未获取到监听地址（可能还在初始化）".to_string());
+                            tui::set_toast(&format!("ID: {}", &state.local_peer_id.to_string()[..8]));
+                        } else {
+                            let addrs: Vec<String> = state.listen_addrs.clone();
+                            for addr in &addrs {
+                                state.log(format!("[我的信息] 监听地址: {addr}"));
+                            }
+                            let first = &addrs[0];
+                            tui::set_toast(&format!("地址已显示在日志页: {}", &first[..first.len().min(40)]));
+                        }
+                    }
                     tui::UiCmd::AddFriend { addr, bootstrap } => {
                         add_friend(&mut swarm, &mut state, &addr, bootstrap);
                     }
@@ -544,6 +584,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
             _ = ticker.tick() => {}
+            _ = save_timer.tick() => {
+                state.flush_conversations();
+            }
             _ = dht_timer.tick() => {
                 if state.dht_enabled {
                     // 周期性查询 DHT 上的在线节点，并刷新路由表
@@ -552,6 +595,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+
+    // 退出前强制把所有未持久化的聊天记录写盘
+    state.flush_conversations();
 
     // 退出 TUI：恢复终端原状
     if let Some(term) = terminal.as_mut() {
@@ -677,7 +723,9 @@ fn send_chat(swarm: &mut Swarm<MyBehaviour>, state: &mut AppState, text: &str) {
         };
         match encrypt_json(&key, &msg) {
             Ok(env) => {
-                swarm.behaviour_mut().chat.send_request(&peer, env);
+                let req_id = swarm.behaviour_mut().chat.send_request(&peer, env);
+                // 记录待确认消息，用于超时/失败后自动重传
+                state.pending_chat_msgs.insert(req_id, (peer, msg.clone(), 0));
                 // 自己的消息也存进本地聊天记录（绿色显示）
                 state.record_to_peer(
                     peer,
@@ -725,7 +773,10 @@ fn handle_swarm_event(
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
-            state.log(format!("[监听] 正在地址: {address} 等待连接"));
+            // 记录带 /p2p/<id> 的完整地址，可直接发给好友做直连
+            let addr_with_id = format!("{}/p2p/{}", address, state.local_peer_id);
+            state.listen_addrs.push(addr_with_id.clone());
+            state.log(format!("[监听] 正在地址: {addr_with_id} 等待连接"));
         }
         SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
             if state.connected.insert(peer_id) {
@@ -890,9 +941,10 @@ fn handle_chat_event(
         }
         request_response::Event::Message {
             peer,
-            message: request_response::Message::Response { response, .. },
+            message: request_response::Message::Response { request_id, response },
         } => {
-            // 我方发出的消息收到 ACK -> 做成小提示（toast），不占整行
+            // 收到 ACK -> 从待确认表移除
+            state.pending_chat_msgs.remove(&request_id);
             if response.ok {
                 state.log(format!("[聊天] 消息 #{} 已送达确认(ACK)", response.msg_id));
                 tui::set_toast("✓ 消息已送达");
@@ -903,7 +955,32 @@ fn handle_chat_event(
             let _ = peer;
         }
         request_response::Event::OutboundFailure { peer, request_id, error } => {
-            state.log(format!("[聊天] 发送给 {peer} 失败: {error:?} (id={request_id:?})"));
+            // 发送失败/超时 -> 自动重传，最多 3 次
+            if let Some((_, msg, retries)) = state.pending_chat_msgs.remove(&request_id) {
+                if retries < 3 {
+                    state.log(format!(
+                        "[聊天] 消息 #{} 发送失败({:?})，第{}次重传…",
+                        msg.msg_id, error, retries + 1
+                    ));
+                    tui::set_toast(&format!("↻ 消息重传中({}/3)", retries + 1));
+                    if let Some(key) = state.sessions.get(&peer).copied() {
+                        if let Ok(env) = encrypt_json(&key, &msg) {
+                            let new_id = swarm.behaviour_mut().chat.send_request(&peer, env);
+                            state.pending_chat_msgs.insert(new_id, (peer, msg, retries + 1));
+                        }
+                    }
+                } else {
+                    state.log(format!("[聊天] 消息 #{} 重试3次仍失败，放弃", msg.msg_id));
+                    tui::set_toast("✗ 消息发送失败（已重试3次）");
+                    let ts = state.tick_ts();
+                    state.record_to_peer(
+                        peer,
+                        ChatRecord::system(&format!("[系统] 消息「{}」发送失败", msg.text), ts),
+                    );
+                }
+            } else {
+                state.log(format!("[聊天] 发送给 {peer} 失败: {error:?} (id={request_id:?})"));
+            }
         }
         _ => {}
     }
